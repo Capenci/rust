@@ -1,170 +1,180 @@
-use actix_web::{web::{self}, App, HttpResponse, HttpServer, Responder};
-use rusqlite::{params, Connection};
-use serde;
-use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+use actix_web::{web, App, HttpResponse, HttpServer};
+use rdkafka::Message;
+use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::consumer::{StreamConsumer, Consumer};
+use std::sync::{Arc, Mutex};
+use actix_web::{error, delete, get, post, put};
+use chrono::Local;
 
-mod handler;
-use handler::kafka_handler;
 
-// #[derive(Debug, serde::Serialize, serde::Deserialize)]
-// struct Todo {
-//     id: i32,
-//     name: String,
-//     description: String,
-// }
-// #[derive(serde::Deserialize)]
-// struct QueryParams {
-//     id: i32,
-// }
-#[derive(serde::Deserialize)]
-struct QueryParams {
-    message: String,
+struct RateLimiter {
+    window_size: usize,
+    max_requests: usize,
+    requests: Vec<Instant>,
+    message_counter: usize,
 }
-// #[derive(serde::Deserialize)]
-struct AppState {
-    conn: Mutex<Connection>,
+#[derive(serde::Serialize,serde::Deserialize)]
+struct Data {
+    data : i32,
+}
+#[derive(serde::Serialize,serde::Deserialize)]
+struct Detail {
+    number_of_requests : i32,
+    sum : i32,
+    timestamp : String
+}
+static  mut detail :Detail = Detail {
+    number_of_requests : 0,
+    sum : 0,
+    timestamp : String::new()
+};
+impl RateLimiter {
+    fn new(window_size: usize, max_requests: usize) -> Self {
+        RateLimiter {
+            window_size,
+            max_requests,
+            requests: Vec::with_capacity(max_requests),
+            message_counter: 0,
+        }
+    }
+
+    fn allow_request(&mut self) -> bool {
+        let now = Instant::now();
+        self.requests.retain(|&t| now.duration_since(t) < Duration::from_secs(self.window_size as u64));
+        if self.requests.len() >= self.max_requests || self.message_counter >= self.max_requests {
+            return false;
+        }
+        self.requests.push(now);
+        self.message_counter += 1;
+        true
+    }
+
+    fn decrease_message_counter(&mut self) {
+        self.message_counter -= 1;
+    }
 }
 
-// fn get_todos(db: web::Data<AppState>) -> Result<Vec<Todo>, rusqlite::Error> {
-//     // let conn = Connection::open("todo.db")?;
-//     let conn =db.conn.lock().unwrap();
-//     let mut stmt = conn.prepare("SELECT * FROM list")?;
-//     let rows = stmt.query_map(params![], |row| {
-//         Ok(Todo {
-//             id: row.get(0)?,
-//             name: row.get(1)?,
-//             description: row.get(2)?,
-//         })
-//     })?;
-//     let mut todos = Vec::new();
-//     for todo in rows {
-//         todos.push(todo?);
-//     }
+async fn kafka_handler(
+    data: Arc<Mutex<RateLimiter>>,
+    consumer: StreamConsumer,
+) {
+    loop {
+        let allowed = data.lock().unwrap().allow_request();
+        if allowed {
+            match consumer.recv().await {
+                Ok(result) => {            
+                    match result.payload() {
+                        Some(value) => {
+                            let json_str = String::from_utf8_lossy(value).into_owned();
+                            let json_data: Result<Data, serde_json::Error> = serde_json::from_str(&json_str);
+                            match json_data {
+                                Ok(dt) => {
+                                    unsafe{
+                                        detail.number_of_requests +=1;
+                                        detail.sum+= dt.data;
+                                    }
+                                }
+                                Err(e)=>{
+                                    println!("{:?}",e)
+                                }
+                            }
+                        }
+                        None => {
+                            println!("Not contain value");
+                        }
+                    }
+                    data.lock().unwrap().decrease_message_counter();
+                    // println!("Number of requests: {}, Sum: {}, at: {}",number_of_requests,sum,Local::now().to_rfc3339());
+                }
+                Err(err) => {
+                    data.lock().unwrap().decrease_message_counter();
+                    println!("{:?}",err);
+                    continue;
+                }
+            }
+        }
+    }
+}
+#[post("")]
+async fn publish_to_kafka(
+    producer: web::Data<FutureProducer>,
+    message :  web::Json<Data>
+) -> HttpResponse {
+            let topic = format!("topic_queue");
+            let json_string = serde_json::to_string(&message.0).unwrap();
+            let record = FutureRecord::to(&topic)
+                .payload(&json_string)
+                .key("key");
+            match producer.send_result(record) {
+                Ok(_) => {
+                    println!("message_{:?}",message.0.data)
+                }
+                Err(_) => println!("Can not send message"),
+            }
 
-//     Ok(todos)
-// }
-
-// fn get_todos_with_id(query_params: web::Query<QueryParams>,db: web::Data<AppState>) -> Result<Todo, rusqlite::Error> {
-//     let id = query_params.id;
-//     let conn =db.conn.lock().unwrap();
-//     let mut stmt = conn.prepare("SELECT * FROM list WHERE id = ?1")?;
-//     let todo = stmt.query_row(params![id], |row| {
-//         Ok(Todo {
-//             id: row.get(0)?,
-//             name: row.get(1)?,
-//             description: row.get(2)?,
-//         })
-//     })?;
-
-//     Ok(todo)
+        HttpResponse::Ok().body("Send message to kafka")
+        
+    }
+#[get("")]
+async fn get_detail()-> HttpResponse{
+    unsafe{
+        detail.timestamp = Local::now().to_rfc3339();
+        let temp = serde_json::to_string(&detail).unwrap();
+        HttpResponse::Ok().body(temp)
+    }
     
-// }
-
-
-
-// fn add_todo(todo: web::Json<Todo>,db: web::Data<AppState>) -> Result<HttpResponse, rusqlite::Error> {
-//     let conn =db.conn.lock().unwrap();
-//     conn.execute(
-//         "INSERT INTO list (name, description) VALUES (?1, ?2)",
-//         params![todo.name, todo.description],
-//     )?;
-//     Ok(HttpResponse::Ok().body("Todo added successfully"))
-// }
-
-// fn delete_todo(query_params: web::Query<QueryParams>, db: web::Data<AppState>) -> Result<HttpResponse, rusqlite::Error> {
-//     let conn =db.conn.lock().unwrap();
-//     conn.execute(
-//         "DELETE FROM list WHERE id = ?1",
-//         params![query_params.id],
-//     )?;
-//     Ok(HttpResponse::Ok().body("Todo delete successfully"))
-// }
-
-// fn update_todo(query_params: web::Json<Todo>, db: web::Data<AppState>) -> Result<HttpResponse, rusqlite::Error> {
-//     let conn = Connection::open("todo.db")?;
-//     conn.execute(
-//         "UPDATE list SET name = ?1, description = ?2 WHERE id = ?3",
-//         params![query_params.name,query_params.description,query_params.id],
-//     )?;
-//     Ok(HttpResponse::Ok().body("Todo update successfully"))
-// }
-
-// async fn todos(conn: web::Data<AppState>) -> impl Responder {
-//     match get_todos(conn) {
-//         Ok(todos) => HttpResponse::Ok().json(todos),
-//         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-//     }
-// }
-
-// async fn add_todo_handler(todo: web::Json<Todo>,conn: web::Data<AppState>) -> impl Responder {
-//     match add_todo(todo,conn) {
-//         Ok(response) => response,
-//         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-//     }
-// }
-// async fn delete_todo_handler(querry_params: web::Query<QueryParams>,conn: web::Data<AppState>) -> impl Responder {
-//     match delete_todo(querry_params,conn) {
-//         Ok(response) => response,
-//         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-//     }
-// }
-
-// async fn update_todo_handler(querry_params: web::Json<Todo>,conn: web::Data<AppState>) -> impl Responder {
-//     match update_todo(querry_params,conn) {
-//         Ok(response) => response,
-//         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-//     }
-// }
-// async fn todo_id(querry_params: web::Query<QueryParams>,conn: web::Data<AppState>) -> impl Responder {
-//     match get_todos_with_id(querry_params,conn){
-//         Ok(todos) => HttpResponse::Ok().json(todos),
-//         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-//     }
-// }
-
-async fn get_message() -> impl Responder{
-    match kafka_handler::consume_messages("192.168.56.131:9092", "topic"){
-        Ok(data) => HttpResponse::Ok().json(data),
-        Err(error) => { HttpResponse::InternalServerError().body(error.to_string())},
-    }
-
 }
-
-async fn create_message(querry_params: web::Json<QueryParams>) ->impl Responder{
-    match kafka_handler::publish_message("192.168.56.131:9092", "topic",&querry_params.message){
-        Ok(_) =>HttpResponse::Ok().body("Create message success"),
-        Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-    }
+pub fn config(conf: &mut web::ServiceConfig) {
+    let scope = web::scope("/kafka")
+        .service(publish_to_kafka)
+        .service(get_detail);
+    conf.service(scope);
 }
-
-async fn create_json(querry_params: web::Json<kafka_handler::MyMessage>) ->impl Responder{
-    match kafka_handler::publish_json("192.168.56.131:9092", "topic",querry_params.0){
-        Ok(_) =>HttpResponse::Ok().body("Create message success"),
-        Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-    }
-}
-
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let conn = Connection::open("todo.db").expect("Failed to create database connection");
-    let shared_conn = web::Data::new(AppState {
-        conn: Mutex::new(conn),
+    std::env::set_var("RUST_LOG", "debug");
+    env_logger::init();
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(60, 100))); // 5-second window, 10 max requests
+    let consumer: StreamConsumer = rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .set("auto.offset.reset", "latest")
+        .set("group.id", "console-consumer-50323")
+        .create()
+        .expect("Failed to create Kafka consumer");
+    consumer.subscribe(&["topic_queue"]).expect("Failed to subscribe to Kafka topic");
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("Failed to create Kafka producer");
+    let  rate_limiter1 = rate_limiter.clone();
+    // let  producer1 = producer.clone();
+    thread::spawn(move||{
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build().expect("Failed to create Tokio runtime.");
+        rt.block_on(async {
+            // handler(rate_limiter1.clone(), producer1.clone()).await;
+            kafka_handler(rate_limiter1.clone(), consumer).await;
+        });
+        
     });
     HttpServer::new(move || {
         App::new()
-            .app_data(shared_conn.clone())
-            .route("/message", web::get().to(get_message))
-            .route("/message", web::post().to(create_message))
-            .route("/message_json", web::post().to(create_json))
-            // .route("/todos", web::get().to(todos))
-            // .route("/todos", web::post().to(add_todo_handler))
-            // .route("/todo", web::get().to(todo_id))
-            // .route("/todo", web::delete().to(delete_todo_handler))
-            // .route("/todo", web::patch().to(update_todo_handler))
-
+            .app_data(rate_limiter.clone())
+            .app_data(web::Data::new(producer.clone()))
+            .service(
+                web::scope("/api")
+                .configure(config)
+            )
+            // .route("/kafka", web::post().to(push_to_deque))
+            // .route("/test", web::post().to(publish_to_kafka))
     })
     .bind("127.0.0.1:8080")?
     .run()
     .await
 }
+
